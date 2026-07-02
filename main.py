@@ -1,489 +1,353 @@
-import sys
+import sqlite3
+import pandas as pd
 import os
 import json
-import uuid
-import subprocess
-from datetime import datetime
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QFileDialog, QCheckBox, QTimeEdit, QDateEdit, QTableWidget,
-                             QTableWidgetItem, QTextEdit, QLabel, QGroupBox, QHeaderView, QLineEdit,
-                             QRadioButton, QComboBox, QStackedWidget, QSystemTrayIcon, QMenu, QAction, QStyle)
-from PyQt5.QtCore import pyqtSignal, QObject, Qt, QDate, QSettings
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import warnings
 
-import pythoncom
-import win32com.client
+# Pandas의 띄어쓰기 관련 경고 메시지를 숨김 처리 (터미널 출력 방지)
+warnings.filterwarnings('ignore', category=UserWarning, module='pandas')
 
-CONFIG_FILE = "scheduler_config.json"
-AUTOSTART_REG_KEY = "PythonMultiScheduler_v6"
+# 설정 파일 경로 (마지막 실행 경로 저장용)
+CONFIG_FILE = "config.json"
 
 
-class WorkerSignals(QObject):
-    log_signal = pyqtSignal(str)
-    status_signal = pyqtSignal(str, str, str)
+class ValidationApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("데이터 검증 프로그램")
+        self.root.geometry("900x650")
 
-
-class MultiSchedulerApp(QMainWindow):
-    def __init__(self) -> None:
-        super().__init__()
-        self.setWindowTitle("CMC 스케줄러")
-        self.setGeometry(100, 100, 1150, 800)
-
-        self.tasks = []
-
-        self.scheduler = BackgroundScheduler()
-        self.scheduler.start()
-        self.signals = WorkerSignals()
-        self.signals.log_signal.connect(self.append_log)
-        self.signals.status_signal.connect(self.update_table_status)
-
-        self.init_ui()
-        self.init_tray_icon()  # 트레이 아이콘 초기화
+        # 기본 설정값
+        self.config = {
+            "main_csv": "",
+            "main_rule": "",
+            "sub_csv": "",
+            "sub_rule": "",
+            "output_dir": ""
+        }
         self.load_config()
 
-    def init_ui(self) -> None:
-        main_layout = QVBoxLayout()
+        # UI 구성
+        self.create_widgets()
 
-        config_box = QGroupBox("새 작업 등록 및 시스템 설정")
-        config_layout = QVBoxLayout()
+    def load_config(self):
+        """설정 파일(JSON)을 불러와서 기존 경로를 복구합니다."""
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    saved_config = json.load(f)
+                    self.config.update(saved_config)
+            except Exception:
+                pass
 
-        # [신규 추가] 시스템 설정 (자동 시작)
-        sys_row = QHBoxLayout()
-        self.autostart_cb = QCheckBox("PC 부팅 시 백그라운드로 자동 시작 (윈도우 시작프로그램 등록)")
+    def save_config(self):
+        """현재 UI에 입력된 경로들을 설정 파일에 저장합니다."""
+        self.config["main_csv"] = self.main_csv_var.get()
+        self.config["main_rule"] = self.main_rule_var.get()
+        self.config["sub_csv"] = self.sub_csv_var.get()
+        self.config["sub_rule"] = self.sub_rule_var.get()
+        self.config["output_dir"] = self.output_dir_var.get()
 
-        # 현재 레지스트리 상태 읽어와서 체크박스에 반영 (r 추가하여 이스케이프 경고 해결)
-        settings = QSettings(r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run",
-                             QSettings.NativeFormat)
-        if settings.contains(AUTOSTART_REG_KEY):
-            self.autostart_cb.setChecked(True)
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.config, f, ensure_ascii=False, indent=4)
 
-        self.autostart_cb.stateChanged.connect(self.toggle_autostart)
-        sys_row.addWidget(self.autostart_cb)
-        sys_row.addStretch(1)
-        config_layout.addLayout(sys_row)
+    def create_widgets(self):
+        """UI 화면의 각 요소들을 배치합니다."""
+        # --- [1] 파일 경로 설정 영역 ---
+        frame_paths = tk.LabelFrame(self.root, text="파일 및 경로 설정", padx=10, pady=10)
+        frame_paths.pack(fill="x", padx=10, pady=5)
 
-        # 구분선 역할
-        frame = QWidget()
-        frame.setFixedHeight(1)
-        frame.setStyleSheet("background-color: #ccc;")
-        config_layout.addWidget(frame)
+        self.main_csv_var = tk.StringVar(value=self.config["main_csv"])
+        self.main_rule_var = tk.StringVar(value=self.config["main_rule"])
+        self.sub_csv_var = tk.StringVar(value=self.config["sub_csv"])
+        self.sub_rule_var = tk.StringVar(value=self.config["sub_rule"])
+        self.output_dir_var = tk.StringVar(value=self.config["output_dir"])
 
-        # 1. 파일 선택
-        file_row = QHBoxLayout()
-        self.file_label = QLabel("선택된 파일 없음")
-        btn_browse = QPushButton("파일 찾아보기")
-        btn_browse.clicked.connect(self.browse_file)
-        file_row.addWidget(btn_browse)
-        file_row.addWidget(self.file_label, 1)
-        config_layout.addLayout(file_row)
+        # 파일 경로가 변경될 때마다 실행 옵션을 자동으로 선택하도록 이벤트 연결
+        for var in (self.main_csv_var, self.main_rule_var, self.sub_csv_var, self.sub_rule_var):
+            var.trace_add("write", self.auto_select_run_option)
 
-        # 2. 매크로 이름 입력
-        macro_row = QHBoxLayout()
-        macro_row.addWidget(QLabel("VBA 매크로명:"))
-        self.macro_input = QLineEdit()
-        self.macro_input.setPlaceholderText("엑셀(.xlsm, .xlsb) 파일 선택 시 필수 입력 (예: Module1.MyMacro)")
-        self.macro_input.setEnabled(False)
-        macro_row.addWidget(self.macro_input, 1)
-        config_layout.addLayout(macro_row)
+        def add_file_row(parent, label_text, var, row, is_dir=False):
+            tk.Label(parent, text=label_text).grid(row=row, column=0, sticky="w", pady=2)
+            tk.Entry(parent, textvariable=var, width=65).grid(row=row, column=1, padx=5, pady=2)
 
-        # 3. 실행 기간 설정
-        period_row = QHBoxLayout()
-        period_row.addWidget(QLabel("실행 기간:"))
-        self.start_date_edit = QDateEdit()
-        self.start_date_edit.setCalendarPopup(True)
-        self.start_date_edit.setDate(QDate.currentDate())
-        period_row.addWidget(self.start_date_edit)
-        period_row.addWidget(QLabel(" ~ "))
-        self.use_end_date_cb = QCheckBox("종료일 지정")
-        self.end_date_edit = QDateEdit()
-        self.end_date_edit.setCalendarPopup(True)
-        self.end_date_edit.setDate(QDate.currentDate().addDays(30))
-        self.end_date_edit.setEnabled(False)
-        self.use_end_date_cb.toggled.connect(self.end_date_edit.setEnabled)
-        period_row.addWidget(self.use_end_date_cb)
-        period_row.addWidget(self.end_date_edit)
-        period_row.addStretch(1)
-        config_layout.addLayout(period_row)
+            def browse():
+                if is_dir:
+                    path = filedialog.askdirectory()
+                else:
+                    path = filedialog.askopenfilename(
+                        filetypes=[("Excel/CSV Files", "*.xlsx *.csv"), ("All Files", "*.*")])
+                if path:
+                    var.set(path)
 
-        # 4. 실행 방식 (매주 / 매월) 선택 라디오 버튼
-        type_row = QHBoxLayout()
-        type_row.addWidget(QLabel("반복 방식:"))
-        self.radio_weekly = QRadioButton("매주 (특정 요일)")
-        self.radio_monthly = QRadioButton("매월 (특정 날짜)")
-        self.radio_weekly.setChecked(True)
-        type_row.addWidget(self.radio_weekly)
-        type_row.addWidget(self.radio_monthly)
-        type_row.addStretch(1)
-        config_layout.addLayout(type_row)
+            tk.Button(parent, text="찾아보기", command=browse).grid(row=row, column=2, pady=2)
 
-        # 5. 실행 상세 조건 (스택 위젯)
-        self.schedule_stack = QStackedWidget()
+        add_file_row(frame_paths, "Main 데이터 (CSV):", self.main_csv_var, 0)
+        add_file_row(frame_paths, "Main 검증 룰 (Excel):", self.main_rule_var, 1)
+        tk.Label(frame_paths, text="-" * 110).grid(row=2, column=0, columnspan=3)
+        add_file_row(frame_paths, "Sub 데이터 (CSV):", self.sub_csv_var, 3)
+        add_file_row(frame_paths, "Sub 검증 룰 (Excel):", self.sub_rule_var, 4)
+        tk.Label(frame_paths, text="-" * 110).grid(row=5, column=0, columnspan=3)
+        add_file_row(frame_paths, "결과 저장 폴더:", self.output_dir_var, 6, is_dir=True)
 
-        self.weekly_widget = QWidget()
-        day_layout = QHBoxLayout(self.weekly_widget)
-        day_layout.setContentsMargins(0, 0, 0, 0)
-        day_layout.addWidget(QLabel("실행 요일:"))
-        self.day_mapping = {
-            "월": "mon", "화": "tue", "수": "wed", "목": "thu", "금": "fri", "토": "sat", "일": "sun"
-        }
-        self.day_checkboxes = {}
-        for kor, eng in self.day_mapping.items():
-            cb = QCheckBox(kor)
-            day_layout.addWidget(cb)
-            self.day_checkboxes[eng] = cb
-        day_layout.addStretch(1)
-        self.schedule_stack.addWidget(self.weekly_widget)
+        # --- [2] 실행 옵션 영역 ---
+        frame_options = tk.Frame(self.root)
+        frame_options.pack(fill="x", padx=10, pady=5)
 
-        self.monthly_widget = QWidget()
-        month_layout = QHBoxLayout(self.monthly_widget)
-        month_layout.setContentsMargins(0, 0, 0, 0)
-        month_layout.addWidget(QLabel("실행 날짜:"))
-        self.month_day_combo = QComboBox()
-        for i in range(1, 32):
-            self.month_day_combo.addItem(f"매월 {i}일", str(i))
-        self.month_day_combo.addItem("매월 말일(마지막 날)", "last")
-        month_layout.addWidget(self.month_day_combo)
-        month_layout.addStretch(1)
-        self.schedule_stack.addWidget(self.monthly_widget)
+        self.run_option_var = tk.IntVar(value=3)
+        tk.Radiobutton(frame_options, text="Main만 실행", variable=self.run_option_var, value=1).pack(side="left", padx=10)
+        tk.Radiobutton(frame_options, text="Sub만 실행", variable=self.run_option_var, value=2).pack(side="left", padx=10)
+        tk.Radiobutton(frame_options, text="모두 실행 (Main + Sub)", variable=self.run_option_var, value=3).pack(
+            side="left", padx=10)
 
-        self.radio_weekly.toggled.connect(lambda: self.schedule_stack.setCurrentWidget(self.weekly_widget))
-        self.radio_monthly.toggled.connect(lambda: self.schedule_stack.setCurrentWidget(self.monthly_widget))
+        self.run_btn_text = tk.StringVar(value="▶ 검증 실행")
+        self.run_btn = tk.Button(frame_options, textvariable=self.run_btn_text, bg="#4CAF50", fg="white",
+                                 font=("Arial", 11, "bold"), command=self.run_process)
+        self.run_btn.pack(side="right", padx=10)
 
-        config_layout.addWidget(self.schedule_stack)
+        # 초기 프로그램 로드 시 입력된 경로를 바탕으로 라디오 버튼 상태 업데이트
+        self.auto_select_run_option()
 
-        # 6. 시간 선택 및 등록
-        time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("실행 시간:"))
-        self.time_edit = QTimeEdit()
-        self.time_edit.setDisplayFormat("HH:mm")
-        btn_add = QPushButton("스케줄 추가")
-        btn_add.clicked.connect(self.add_task)
-        time_row.addWidget(self.time_edit)
-        time_row.addWidget(btn_add, 1)
-        config_layout.addLayout(time_row)
+        # --- [3] 결과 출력 영역 (Treeview) ---
+        frame_results = tk.LabelFrame(self.root, text="실행 결과 대시보드 (오류 내역 우클릭 시 복사 가능)", padx=10, pady=10)
+        frame_results.pack(fill="both", expand=True, padx=10, pady=5)
 
-        config_box.setLayout(config_layout)
-        main_layout.addWidget(config_box)
+        columns = ("target", "rule_name", "status", "total_cnt", "error_cnt", "error_msg")
+        self.tree = ttk.Treeview(frame_results, columns=columns, show="headings")
 
-        # 테이블
-        self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(["작업 대상 (파일/매크로)", "실행 기간", "실행 주기", "상태", "마지막 실행", "다음 실행", "관리"])
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        main_layout.addWidget(self.table)
+        self.tree.heading("target", text="타겟")
+        self.tree.heading("rule_name", text="검증 룰")
+        self.tree.heading("status", text="결과")
+        self.tree.heading("total_cnt", text="총 데이터")
+        self.tree.heading("error_cnt", text="오류 건수")
+        self.tree.heading("error_msg", text="비고 (SQL 오류 등)")
 
-        # 로그
-        log_box = QGroupBox("실시간 실행 로그")
-        log_layout = QVBoxLayout()
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        log_layout.addWidget(self.log_view)
-        log_box.setLayout(log_layout)
-        main_layout.addWidget(log_box, 1)
+        self.tree.column("target", width=60, anchor="center")
+        self.tree.column("rule_name", width=220, anchor="w")
+        self.tree.column("status", width=80, anchor="center")
+        self.tree.column("total_cnt", width=90, anchor="e")
+        self.tree.column("error_cnt", width=80, anchor="e")
+        self.tree.column("error_msg", width=300, anchor="w")
 
-        container = QWidget()
-        container.setLayout(main_layout)
-        self.setCentralWidget(container)
+        self.tree.pack(fill="both", expand=True)
 
-        self.current_selected_file = ""
+        # 더블클릭 및 우클릭 이벤트 바인딩
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+        self.tree.bind("<Button-3>", self.show_context_menu)
+        self.tree.bind("<Button-2>", self.show_context_menu)
 
-    def init_tray_icon(self) -> None:
-        # 시스템 기본 아이콘 사용
-        self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
+    def auto_select_run_option(self, *args):
+        """입력된 파일 경로 유무를 감지하여 실행 옵션 라디오 버튼을 자동 선택합니다."""
+        main_ready = bool(self.main_csv_var.get().strip() and self.main_rule_var.get().strip())
+        sub_ready = bool(self.sub_csv_var.get().strip() and self.sub_rule_var.get().strip())
 
-        # 우클릭 메뉴 설정
-        tray_menu = QMenu()
+        if main_ready and sub_ready:
+            self.run_option_var.set(3)  # 모두 실행
+        elif main_ready and not sub_ready:
+            self.run_option_var.set(1)  # Main만 실행
+        elif sub_ready and not main_ready:
+            self.run_option_var.set(2)  # Sub만 실행
 
-        show_action = QAction("관리자 화면 열기", self)
-        show_action.triggered.connect(self.showNormal)
-        tray_menu.addAction(show_action)
+    def show_context_menu(self, event):
+        """Treeview에서 우클릭 시 복사 메뉴를 띄웁니다."""
+        row_id = self.tree.identify_row(event.y)
+        column_id = self.tree.identify_column(event.x)
 
-        quit_action = QAction("완전히 종료", self)
-        quit_action.triggered.connect(self.quit_application)
-        tray_menu.addAction(quit_action)
+        if row_id:
+            self.tree.selection_set(row_id)
+            self.tree.focus(row_id)
 
-        self.tray_icon.setContextMenu(tray_menu)
+            item_values = self.tree.item(row_id, "values")
 
-        # 더블클릭 이벤트 연결
-        self.tray_icon.activated.connect(self.on_tray_icon_activated)
-        self.tray_icon.show()
+            if column_id == '#6':
+                error_msg = item_values[5]
 
-    def on_tray_icon_activated(self, reason):
-        if reason == QSystemTrayIcon.DoubleClick:
-            self.showNormal()
-            self.activateWindow()
+                if error_msg and error_msg != "-":
+                    context_menu = tk.Menu(self.root, tearoff=0)
+                    context_menu.add_command(
+                        label="비고(오류 메시지) 복사",
+                        command=lambda: self.copy_to_clipboard_direct(error_msg)
+                    )
+                    context_menu.post(event.x_root, event.y_root)
 
-    def toggle_autostart(self, state):
-        # r 추가하여 이스케이프 경고 해결
-        settings = QSettings(r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run",
-                             QSettings.NativeFormat)
-        if state == Qt.Checked:
-            # exe로 패키징되었는지 파이썬 스크립트 상태인지 구분하여 경로 등록
-            if getattr(sys, 'frozen', False):
-                cmd_path = f'"{sys.executable}" --hidden'
-            else:
-                cmd_path = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}" --hidden'
+    def copy_to_clipboard_direct(self, text):
+        """전달받은 텍스트를 클립보드에 팝업 없이 즉시 복사합니다."""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
 
-            settings.setValue(AUTOSTART_REG_KEY, cmd_path)
-            self.append_log("[시스템] PC 부팅 시 자동 시작이 설정되었습니다.")
-        else:
-            settings.remove(AUTOSTART_REG_KEY)
-            self.append_log("[시스템] 부팅 시 자동 시작이 해제되었습니다.")
-
-    def closeEvent(self, event) -> None:
-        # 'X' 버튼을 눌렀을 때 완전히 종료되지 않고 트레이로 숨김
-        event.ignore()
-        self.hide()
-        self.tray_icon.showMessage(
-            "백그라운드 실행 중",
-            "스케줄러가 시스템 트레이에서 계속 작동합니다.",
-            QSystemTrayIcon.Information,
-            2000
-        )
-
-    def quit_application(self) -> None:
-        # 트레이에서 '완전히 종료'를 눌렀을 때만 실제 종료 프로세스 수행
-        if self.scheduler.running:
-            self.scheduler.shutdown()
-        QApplication.quit()
-
-    def browse_file(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "파일 선택", "",
-            "지원하는 파일 (*.py *.exe *.xlsm *.xlsb);;Python Files (*.py *.exe);;Excel Macro Files (*.xlsm *.xlsb)"
-        )
-        if file_path:
-            self.current_selected_file = file_path
-            self.file_label.setText(os.path.basename(file_path))
-            if file_path.lower().endswith(('.xlsm', '.xlsb')):
-                self.macro_input.setEnabled(True)
-                self.macro_input.setFocus()
-            else:
-                self.macro_input.setEnabled(False)
-                self.macro_input.clear()
-
-    def add_task(self) -> None:
-        if not self.current_selected_file:
-            self.append_log("[경고] 먼저 실행할 파일을 선택해주세요.")
+    def on_tree_double_click(self, event):
+        """Treeview 항목 더블클릭 시 상세 메시지 팝업을 띄웁니다."""
+        selected_item = self.tree.selection()
+        if not selected_item:
             return
 
-        macro_name = self.macro_input.text().strip()
-        if self.current_selected_file.lower().endswith(('.xlsm', '.xlsb')) and not macro_name:
-            self.append_log("[경고] 엑셀 파일을 스케줄링하려면 실행할 VBA 매크로 이름을 반드시 입력해야 합니다.")
+        item_values = self.tree.item(selected_item[0], "values")
+        error_msg = item_values[5]
+
+        if error_msg and error_msg != "-":
+            self.show_error_popup(item_values[1], error_msg)
+
+    def show_error_popup(self, rule_name, message):
+        """상세 오류 내용을 보여주고 복사할 수 있는 팝업창을 생성합니다."""
+        popup = tk.Toplevel(self.root)
+        popup.title("상세 오류 메시지 확인")
+        popup.geometry("600x300")
+        popup.attributes('-topmost', True)
+
+        tk.Label(popup, text=f"검증 룰: {rule_name}", font=("Arial", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 0))
+
+        text_widget = tk.Text(popup, wrap="word", font=("Consolas", 10))
+        text_widget.insert("1.0", message)
+        text_widget.config(state="disabled")
+        text_widget.pack(fill="both", expand=True, padx=10, pady=10)
+
+        def copy_to_clipboard():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(message)
+            btn_copy.config(text="✓ 복사 완료", bg="#4CAF50")
+
+        btn_copy = tk.Button(popup, text="메시지 복사하기", bg="#2196F3", fg="white", command=copy_to_clipboard)
+        btn_copy.pack(pady=(0, 10))
+
+    def run_process(self):
+        """실행 버튼 클릭 시 유효성 검사 후 작동하는 스레드 트리거 함수입니다."""
+        opt = self.run_option_var.get()
+        out_dir = self.output_dir_var.get().strip()
+
+        # 1. 저장 폴더 입력 확인
+        if not out_dir:
+            messagebox.showerror("오류", "결과를 저장할 폴더를 지정해주세요.")
             return
 
-        schedule_type = "weekly" if self.radio_weekly.isChecked() else "monthly"
-        cron_dow = "*"
-        cron_day = "*"
-        display_cycle = ""
+        # 2. 실행 옵션에 따른 필수 파일 경로 입력 확인
+        main_c = self.main_csv_var.get().strip()
+        main_r = self.main_rule_var.get().strip()
+        sub_c = self.sub_csv_var.get().strip()
+        sub_r = self.sub_rule_var.get().strip()
 
-        if schedule_type == "weekly":
-            selected_days = [eng for eng, cb in self.day_checkboxes.items() if cb.isChecked()]
-            if not selected_days:
-                self.append_log("[경고] 매주 실행의 경우 최소 하나 이상의 요일을 선택해주세요.")
+        if opt == 1:  # Main만 실행
+            if not main_c or not main_r:
+                messagebox.showwarning("경로 누락", "Main 실행을 위해 'Main 데이터'와 '검증 룰' 파일 경로를 모두 입력해주세요.")
                 return
-            cron_dow = ",".join(selected_days)
-            display_cycle = f"매주({cron_dow})"
-        else:
-            cron_day = self.month_day_combo.currentData()
-            display_text = self.month_day_combo.currentText()
-            display_cycle = f"매월({display_text})"
+        elif opt == 2:  # Sub만 실행
+            if not sub_c or not sub_r:
+                messagebox.showwarning("경로 누락", "Sub 실행을 위해 'Sub 데이터'와 '검증 룰' 파일 경로를 모두 입력해주세요.")
+                return
+        elif opt == 3:  # 모두 실행
+            if not main_c or not main_r or not sub_c or not sub_r:
+                messagebox.showwarning("경로 누락",
+                                       "모두 실행하려면 Main 및 Sub 데이터와 검증 룰 등 4개의 파일 경로를 전부 입력해야 합니다.\n(일부만 입력하셨다면 해당 옵션으로 변경해 주세요.)")
+                return
 
-        time_obj = self.time_edit.time()
-        hour = time_obj.hour()
-        minute = time_obj.minute()
-
-        start_date_str = self.start_date_edit.date().toString("yyyy-MM-dd")
-        end_date_str = self.end_date_edit.date().toString("yyyy-MM-dd") if self.use_end_date_cb.isChecked() else None
-
-        self.register_task(
-            self.current_selected_file, macro_name, start_date_str, end_date_str,
-            schedule_type, cron_dow, cron_day, hour, minute, display_cycle, save=True
-        )
-
-    def register_task(self, file_path: str, macro_name: str, start_date: str, end_date: str,
-                      schedule_type: str, cron_dow: str, cron_day: str, hour: int, minute: int,
-                      display_cycle: str, save: bool = True) -> None:
-        job_id = str(uuid.uuid4())
-
-        try:
-            if schedule_type == "weekly":
-                trigger = CronTrigger(day_of_week=cron_dow, hour=hour, minute=minute, start_date=start_date,
-                                      end_date=end_date)
-            else:
-                trigger = CronTrigger(day=cron_day, hour=hour, minute=minute, start_date=start_date, end_date=end_date)
-
-            job = self.scheduler.add_job(self.execute_script, trigger=trigger, id=job_id,
-                                         args=[file_path, macro_name, job_id])
-        except ValueError as e:
-            self.append_log(f"[설정 오류] 스케줄을 등록할 수 없습니다: {str(e)}")
-            return
-
-        row_index = self.table.rowCount()
-        self.table.insertRow(row_index)
-
-        display_name = os.path.basename(file_path)
-        if macro_name: display_name += f" [{macro_name}]"
-
-        file_item = QTableWidgetItem(display_name)
-        file_item.setData(Qt.UserRole, job_id)
-
-        # \n 을 사용하여 한 줄로 작성해 f-string 오류 해결
-        file_item.setToolTip(f"{file_path}\n매크로: {macro_name}")
-
-        self.table.setItem(row_index, 0, file_item)
-        period_str = f"{start_date} ~ {end_date if end_date else '제한 없음'}"
-        self.table.setItem(row_index, 1, QTableWidgetItem(period_str))
-        self.table.setItem(row_index, 2, QTableWidgetItem(f"{display_cycle} {hour:02d}:{minute:02d}"))
-        self.table.setItem(row_index, 3, QTableWidgetItem("대기 중"))
-        self.table.setItem(row_index, 4, QTableWidgetItem("-"))
-
-        next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S") if job.next_run_time else "기간 만료"
-        self.table.setItem(row_index, 5, QTableWidgetItem(next_run))
-
-        btn_delete = QPushButton("삭제")
-        btn_delete.setProperty("job_id", job_id)
-        btn_delete.clicked.connect(self.delete_task)
-        self.table.setCellWidget(row_index, 6, btn_delete)
-
-        self.tasks.append({
-            "file_path": file_path, "macro_name": macro_name, "start_date": start_date, "end_date": end_date,
-            "schedule_type": schedule_type, "cron_dow": cron_dow, "cron_day": cron_day, "hour": hour, "minute": minute,
-            "job_id": job_id
-        })
-
-        if save:
-            self.save_config()
-            self.append_log(f"[등록 완료] {display_name} 스케줄이 지정되었습니다.")
-
-    def delete_task(self) -> None:
-        button = self.sender()
-        if not button: return
-        job_id = button.property("job_id")
-        try:
-            if self.scheduler.get_job(job_id): self.scheduler.remove_job(job_id)
-        except Exception:
-            pass
-
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            if item and item.data(Qt.UserRole) == job_id:
-                file_name = item.text()
-                self.table.removeRow(row)
-                self.append_log(f"[삭제 완료] {file_name} 스케줄이 삭제되었습니다.")
-                break
-
-        self.tasks = [t for t in self.tasks if t["job_id"] != job_id]
+        # 3. 유효성 검사 통과 시 실제 실행 준비
         self.save_config()
 
-    def execute_script(self, file_path: str, macro_name: str, job_id: str) -> None:
-        file_name = os.path.basename(file_path)
-        start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.signals.log_signal.emit(f"[{start_time}] [시작] {file_name} 작업을 실행합니다.")
-        self.signals.status_signal.emit(job_id, "실행 중", start_time)
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        self.run_btn.config(state="disabled")
+        self.run_btn_text.set("⏳ 실행 중...")
+
+        thread = threading.Thread(target=self._run_process_thread, args=(opt, out_dir))
+        thread.daemon = True
+        thread.start()
+
+    def _safe_tree_insert(self, values):
+        """스레드에서 안전하게 UI(Treeview)를 업데이트하기 위한 래퍼 함수"""
+        self.tree.insert("", "end", values=values)
+
+    def _run_process_thread(self, opt, out_dir):
+        """실제 데이터 처리를 담당하는 백그라운드 스레드 로직입니다."""
+        conn = sqlite3.connect(':memory:')
 
         try:
-            if not os.path.exists(file_path): raise FileNotFoundError("파일이 존재하지 않습니다.")
+            if opt in (1, 3):
+                self._load_and_validate("Main", self.main_csv_var.get(), self.main_rule_var.get(), out_dir, conn)
 
-            if file_path.lower().endswith(('.xlsm', '.xlsb')):
-                pythoncom.CoInitialize()
-                excel = None
-                wb = None
-                try:
-                    excel = win32com.client.Dispatch("Excel.Application")
-                    excel.Visible = False
-                    excel.DisplayAlerts = False
-                    abs_path = os.path.abspath(file_path)
-                    wb = excel.Workbooks.Open(abs_path)
-                    excel.Application.Run(f"'{abs_path}'!{macro_name}")
-                    wb.Save()
-                    self.signals.log_signal.emit(f"[{file_name}] VBA 매크로({macro_name}) 정상 종료 및 저장 완료")
-                finally:
-                    if wb: wb.Close(SaveChanges=False)
-                    if excel: excel.Quit()
-                    pythoncom.CoUninitialize()
-            else:
-                if file_path.endswith('.py'):
-                    # exe로 패키징된 상태인지 체크하여 Python 스크립트 실행 분기 처리
-                    if getattr(sys, 'frozen', False):
-                        result = subprocess.run(["python", file_path], capture_output=True, text=True, check=True)
-                    else:
-                        result = subprocess.run([sys.executable, file_path], capture_output=True, text=True, check=True)
-                else:
-                    result = subprocess.run([file_path], capture_output=True, text=True, check=True)
-
-                if result.stdout:
-                    self.signals.log_signal.emit(f"[{file_name} 출력]:\n{result.stdout.strip()}")
-
-            end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.signals.log_signal.emit(f"[{end_time}] [성공] {file_name} 작업 완료")
-            job = self.scheduler.get_job(job_id)
-            next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S") if job and job.next_run_time else "기간 만료"
-            self.signals.status_signal.emit(job_id, "정상 종료", next_run)
+            if opt in (2, 3):
+                self._load_and_validate("Sub", self.sub_csv_var.get(), self.sub_rule_var.get(), out_dir, conn)
 
         except Exception as e:
-            end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.signals.log_signal.emit(f"[{end_time}] [에러 발생] {file_name} 실패: {str(e)}")
-            job = self.scheduler.get_job(job_id)
-            next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S") if job and job.next_run_time else "기간 만료"
-            self.signals.status_signal.emit(job_id, "오류 발생", next_run)
+            self.root.after(0, lambda e=e: messagebox.showerror("실행 오류", f"작업 중 오류가 발생했습니다:\n{str(e)}"))
+        finally:
+            conn.close()
+            # 실행 완료 후 UI 버튼 텍스트가 원래대로 돌아오는 것으로 작업 완료 확인 가능
+            self.root.after(0, lambda: self.run_btn.config(state="normal"))
+            self.root.after(0, lambda: self.run_btn_text.set("▶ 검증 실행"))
 
-    def append_log(self, text: str) -> None:
-        self.log_view.append(text)
+    def _load_and_validate(self, target_name, csv_path, rule_path, out_dir, conn):
+        """데이터를 로드하고 룰에 따라 검증하는 내부 함수입니다."""
+        if not csv_path or not rule_path:
+            return
 
-    def update_table_status(self, job_id: str, status: str, time_info: str) -> None:
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            if item and item.data(Qt.UserRole) == job_id:
-                self.table.setItem(row, 3, QTableWidgetItem(status))
-                self.table.setItem(row, 4 if status == "실행 중" else 5, QTableWidgetItem(time_info))
-                break
+        table_name = target_name.lower()
 
-    def save_config(self) -> None:
         try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.tasks, f, ensure_ascii=False, indent=4)
-        except:
-            pass
+            # 1차 시도: utf-8 인코딩으로 읽기
+            try:
+                df_data = pd.read_csv(csv_path, encoding='utf-8', low_memory=False)
+            # 2차 시도: exe 환경에서 발생하는 다양한 인코딩 관련 예외를 모두 포괄하여 처리
+            except Exception:
+                df_data = pd.read_csv(csv_path, encoding='cp949', low_memory=False)
 
-    def load_config(self) -> None:
-        if not os.path.exists(CONFIG_FILE): return
+            df_data.to_sql(table_name, conn, if_exists='replace', index=False)
+            total_records = len(df_data)
+        except Exception as e:
+            raise Exception(f"{target_name} 데이터 로드 실패: {e}")
+
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                config_data = json.load(f)
-                for item in config_data:
-                    start_date = item.get("start_date", QDate.currentDate().toString("yyyy-MM-dd"))
-                    end_date = item.get("end_date", None)
-                    macro_name = item.get("macro_name", "")
-                    schedule_type = item.get("schedule_type", "weekly")
-                    cron_dow = item.get("cron_dow", item.get("day_str", "*"))
-                    cron_day = item.get("cron_day", "*")
+            df_rules = pd.read_excel(rule_path)
+        except Exception as e:
+            raise Exception(f"{target_name} 룰 파일 로드 실패: {e}")
 
-                    if schedule_type == "weekly":
-                        display_cycle = f"매주({cron_dow})"
-                    else:
-                        display_cycle = f"매월(매월 {cron_day}일)" if cron_day != 'last' else "매월(매월 말일(마지막 날))"
+        all_errors = []
+        output_excel_path = os.path.join(out_dir, f"{table_name}_audit_result.xlsx")
 
-                    self.register_task(item["file_path"], macro_name, start_date, end_date, schedule_type, cron_dow,
-                                       cron_day, item["hour"], item["minute"], display_cycle, save=False)
-            self.append_log(f"[시스템] 등록된 {len(config_data)}개의 스케줄 설정을 로드했습니다.")
-        except:
-            pass
+        for index, row in df_rules.iterrows():
+            rule_id = str(row.get('number', ''))
+            rule_name = str(row.get('Rule_Name', ''))
+            sql_query = row.get('SQL_Query', '')
+
+            if not sql_query or pd.isna(sql_query):
+                continue
+
+            display_name = f"[{rule_id}] {rule_name}" if rule_id else rule_name
+
+            try:
+                result_df = pd.read_sql_query(sql_query, conn)
+                error_count = len(result_df)
+                status = "🚨 오류" if error_count > 0 else "✅ 정상"
+
+                self.root.after(0, self._safe_tree_insert,
+                                (target_name, display_name, status, f"{total_records:,}건", f"{error_count:,}건", "-"))
+
+                if not result_df.empty:
+                    temp_df = result_df.copy()
+                    temp_df.insert(0, '오류유형', display_name)
+                    all_errors.append(temp_df)
+
+            except Exception as e:
+                error_msg = str(e).replace('\n', ' ')
+                self.root.after(0, self._safe_tree_insert,
+                                (target_name, display_name, "⚠️ SQL실패", f"{total_records:,}건", "N/A", error_msg))
+
+                # [수정됨] exe(noconsole) 환경에서 튕김 현상을 유발할 수 있는 print문 삭제
+
+        if all_errors:
+            final_error_df = pd.concat(all_errors, ignore_index=True)
+            with pd.ExcelWriter(output_excel_path, engine='xlsxwriter') as writer:
+                final_error_df.to_excel(writer, sheet_name='오류내역조회', index=False)
+        else:
+            empty_df = pd.DataFrame(columns=['오류유형', '결과메시지'])
+            empty_df.loc[0] = ['정상', '발견된 오류 데이터가 없습니다.']
+            with pd.ExcelWriter(output_excel_path, engine='xlsxwriter') as writer:
+                empty_df.to_excel(writer, sheet_name='오류내역_없음', index=False)
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-
-    # 마지막 창이 닫혀도 프로그램이 종료되지 않게 설정 (트레이 아이콘 유지를 위해 필수)
-    app.setQuitOnLastWindowClosed(False)
-
-    window = MultiSchedulerApp()
-
-    # --hidden 인자가 있으면 창을 띄우지 않고 트레이에서만 실행 (부팅 시 자동 시작용)
-    if "--hidden" not in sys.argv:
-        window.show()
-
-    sys.exit(app.exec_())
+    root = tk.Tk()
+    app = ValidationApp(root)
+    root.mainloop()
