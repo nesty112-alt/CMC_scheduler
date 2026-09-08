@@ -1,0 +1,34 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Packaging / PyInstaller output
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Keep project spec
+!CMC_Scheduler.spec
+
+# Runtime / local config
+config.json
+scheduler_config.json
+logs/
+samples/output/
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
